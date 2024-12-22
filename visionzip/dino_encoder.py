@@ -25,33 +25,32 @@ from .utils import CLIPAttention_forward, CLIP_EncoderLayer_forward
 
 
 
-class CLIPVisionTower_VisionZip(nn.Module):
+class DINOVisionTower_VisionZip(nn.Module):
 
 
     @torch.no_grad()
-    def forward(self, images):
+    def forward(self, images, all_indices):
         
         if type(images) is list:
             image_features = []
             for image in images:
-                image_forward_out = self.vision_tower(image.to(device=self.device, dtype=self.dtype).unsqueeze(0), output_hidden_states=True, output_attentions=True)
+                image_forward_out = self.vision_tower.forward_features(image.to(device=self.device, dtype=self.dtype).unsqueeze(0))
                 image_feature = self.feature_select(image_forward_out).to(image.dtype)
                 image_features.append(image_feature)
         else:
             
-            image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True, output_attentions=True)
-            attn_weights  = image_forward_outs.attentions[-2] # [batch_size, num_heads, seq_len, seq_len] ex. [1, 16, 577, 577]
-            hidden_states = image_forward_outs.hidden_states[-2] # [batch_size, seq_len, hidden_size] ex. [1, 577, 1024]
-            metric = self.vision_tower.vision_model.encoder.layers[-2].metric # [batch_size, seq_len, k_hidden_size] ex. [1, 577, 64]
+            image_forward_outs = self.vision_tower.forward_features(images.to(device=self.device, dtype=self.dtype))
+            hidden_states = image_forward_outs['x_prenorm'] # [batch_size, seq_len, hidden_size] ex. [1, 577, 1024]
+            metric = hidden_states
             dominant_num =  self.vision_tower._info["dominant"] # domiant - 1
             contextual_num = self.vision_tower._info["contextual"]
 
             ## Dominant Visual Tokens
-            cls_idx = 0
-            cls_attention = attn_weights[:, :, cls_idx, cls_idx+1:]  # [batch_size, num_heads, seq_len-1] ex. [1, 16, 576]
-            cls_attention_sum = cls_attention.sum(dim=1)  # [batch_size, seq_len-1] ex. [1, 576]
-            topk_indices = cls_attention_sum.topk(dominant_num, dim=1).indices + 1 # [batch_size, dominant_num] ex. [1, 53]
-            all_indices = torch.cat([torch.zeros((hidden_states.shape[0], 1), dtype=topk_indices.dtype, device=topk_indices.device), topk_indices], dim=1) # [batch_size, dominant_num] ex. [1, 54]
+            # cls_idx = 0
+            # cls_attention = attn_weights[:, :, cls_idx, cls_idx+1:]  # [batch_size, num_heads, seq_len-1] ex. [1, 16, 576]
+            # cls_attention_sum = cls_attention.sum(dim=1)  # [batch_size, seq_len-1] ex. [1, 576]
+            # topk_indices = cls_attention_sum.topk(dominant_num, dim=1).indices + 1 # [batch_size, dominant_num] ex. [1, 53]
+            # all_indices = torch.cat([torch.zeros((hidden_states.shape[0], 1), dtype=topk_indices.dtype, device=topk_indices.device), topk_indices], dim=1) # [batch_size, dominant_num] ex. [1, 54]
             
             mask = torch.ones_like(hidden_states[:, :, 0], dtype=torch.bool, device=metric.device).scatter_(1, all_indices, False)
             dominant_tokens = hidden_states.masked_select(~mask.unsqueeze(-1)).view(hidden_states.shape[0], dominant_num + 1, hidden_states.shape[2])
@@ -61,7 +60,7 @@ class CLIPVisionTower_VisionZip(nn.Module):
 
             hidden_states_filtered = hidden_states.masked_select(mask.unsqueeze(-1)).view(hidden_states.shape[0], hidden_states.shape[1] - (dominant_num +1), hidden_states.shape[2])  
             
-            metric_normalized = metric_filtered / metric_filtered.norm(dim=-1, keepdim=True) 
+            metric_normalized = metric_filtered 
 
             ## Contextual Visual Tokens
             step = max(1, metric_normalized.shape[1] // contextual_num)
@@ -77,12 +76,12 @@ class CLIPVisionTower_VisionZip(nn.Module):
             aggregated_hidden = torch.bmm(assign_one_hot.transpose(1, 2), hidden_to_merge) / counts
             target_hidden = hidden_states_filtered[:, target_indices, :]  
             
-            contextual_tokens = target_hidden + aggregated_hidden
+            contextual_tokens = (target_hidden + aggregated_hidden) / 2
 
             # Merge with target hidden states and concatenate
             hidden_states_save = torch.cat([dominant_tokens, contextual_tokens], dim=1).to(images.dtype)
 
-        return hidden_states_save, all_indices
+        return hidden_states_save
 
         # return hidden_states_save, hidden_states, all_indices
 
